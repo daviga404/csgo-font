@@ -149,12 +149,59 @@ class CSMTextSettingsTag extends Tag
 
 class DefineFont3Tag extends Tag
 
+    # Constants
+    TTF_HHEA = 0x68686561 # TTF horizontal header table ID
+
     ###*
     # Constructs a new DefineFont3 tag. This should
     # be instantiated with a ByteBuffer, `ttfBuffer`,
     # that contains the TTF data for this font tag.
     #
     # @param {ByteBuffer} ttfBuffer Buffer of TTF data
+    # @throws {TTFException} If the TTF file was invalid
     ###
     constructor: (ttfBuffer) ->
         super 75 # Tag type = 75
+
+        reader = new TTFReader(ttfBuffer)
+        reader.read()
+
+        # Ensure hhea table exists
+        if not reader.getTable TTF_HHEA
+            throw new TTFException('Horizontal header table not found; invalid TTF file?')
+
+class TTFException extends Error
+    constructor: (@message) ->
+        @name = 'TTFException'
+
+class TTFReader
+
+    @tables = {}
+
+    constructor: (data) ->
+        @data = data.clone()
+
+    read: ->
+        @data.reset()
+
+        # SFNT Version used fixed-point arithmetic; multiply fractional part by 2^-bitcount.
+        sfntVersion = @data.readInt16() + @data.readInt16() * Math.pow(2, -16)
+        if sfntVersion is not 1.0
+            throw new TTFException('Invalid SFNT version in TTF file')
+
+        numTables = @data.readUint16()
+        @data.skip 6 # We don't need the searchRange, entrySelector, or rangeShift (each 16 bits)
+
+        for i in [ 0 .. numTables - 1 ]
+            @tables[@data.readUint32()] = {
+                checkSum: @data.readUint32()
+                offset:   @data.readUint32()
+                length:   @data.readUint32()
+            }
+
+    getTable: (name) ->
+        if name in @tables
+            offset = @tables[name].offset
+            length = @tables[name].length
+            return @data.slice offset, offset + length
+        null
