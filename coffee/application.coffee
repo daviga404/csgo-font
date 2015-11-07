@@ -163,38 +163,23 @@ class DefineFont3Tag extends Tag
     # be instantiated with a ByteBuffer, `ttfBuffer`,
     # that contains the TTF data for this font tag.
     #
-    # @param {ByteBuffer} ttfBuffer  Buffer of TTF data
-    # @param {Number}     fileOffset The current offset of the SWF file
+    # @param {ByteBuffer} ttfBuffer       Buffer of TTF data
+    # @param {Number}     settings.fontId The ID to use for this font (required)
     # @throws {TTFException} If the TTF file was invalid
     ###
-    constructor: (ttfBuffer, fileOffset) ->
+    constructor: (ttfBuffer, settings) ->
         super 75 # Tag type = 75
 
         reader = new TTFReader(ttfBuffer)
         reader.read()
 
-        # Get and ensure the necessary tables exist in the file
-        head = (reader.getTable TTF_HEAD) or throw new TTFException('Head table not found')
-        hhea = (reader.getTable TTF_HHEA) or throw new TTFException('Horizontal header table not found')
-
-        # Skip table version, font revision, checksum, and magic number
-        head.skip 16 
-
-        flags = head.readUint16() # We may need this in the future!
-        units = head.readUint16() # Units per EM square
-
-
-
-
-        ###
-        # Ensure hhea table exists
-        if not (hhea = reader.getTable TTF_HHEA)
-            throw new TTFException('Horizontal header table not found; invalid TTF file?')
-
-        if Utils.toFixed hhea.readUint32() is not 1.0
-            throw new TTFException('Invalid SFNT version in TTF file')
-        ###
-
+        @body.writeUint16 settings.fontId
+        @body.writeUint8 (
+            0x80 | # flagsHasLayout = 1
+            0    | # flagsShiftJIS  = 0 (TODO: add support for ShiftJIS)
+            0    | # flagsSmallText = 0
+            # TODO
+        )
 
 class TTFException extends Error
     constructor: (@message) ->
@@ -206,9 +191,25 @@ class TTFReader
     TTF_HHEA = 0x68686561 # Horizontal header table
     TTF_HEAD = 0x68656164 # Head table
     TTF_GLYF = 0x676C7966 # Glyf (glyph) table
+    TTF_CMAP = 0x636D6170 # Cmap (character mapping) table
 
-    FLAG_BIT_0 = 0x1 # Bitmask for bit 0 of flags
-    FLAG_BIT_1 = 0x2 # Bitmask for bit 1 of flags
+    # Bitmask constants
+    FLAG_BIT_0 = 0x1
+    FLAG_BIT_1 = 0x2
+    FLAG_BIT_2 = 0x4
+    FLAG_BIT_3 = 0x8
+    FLAG_BIT_4 = 0x10
+    FLAG_BIT_5 = 0x20
+    FLAG_BIT_6 = 0x40
+    FLAG_BIT_7 = 0x80
+
+    # Single glyph flags
+    FLAG_ON_CURVE  = FLAG_BIT_0
+    FLAG_X_IS_BYTE = FLAG_BIT_1
+    FLAG_Y_IS_BYTE = FLAG_BIT_2
+    FLAG_REPEAT    = FLAG_BIT_3
+    FLAG_X_IS_SAME = FLAG_BIT_4
+    FLAG_Y_IS_SAME = FLAG_BIT_5
 
     constructor: (data) ->
         @data   = data.clone() # ByteBuffer of the raw TTF data
@@ -236,9 +237,10 @@ class TTFReader
                 length:   @data.readUint32()
             }
 
-        # Read the 'head' table and store values
+        # Read individual tables
         this.readHeadTable()
         this.readGlyphs()
+        this.readCmapTable()
 
     readHeadTable: ->
         headBuff = this.getTable TTF_HEAD
@@ -270,6 +272,32 @@ class TTFReader
         @head.indexToLocFormat  = headBuff.readInt16()
         @head.glyphDataFormat   = headBuff.readInt16()
 
+    readCmapTable: ->
+        cmapTable = this.getTable TTF_CMAP
+        if not cmapTable
+            throw new TTFException('Required cmap table not found in TTF file')
+
+        cmapTable.skip 2 # Skip table version number
+        numEncTables = cmapTable.readUint16()
+        encTables    = []
+
+        for i in [ 0 ... numEncTables ]
+            tableOffset  = cmapTable.offset
+            platId       = cmapTable.readUint16()
+            platEncoding = cmapTable.readUint16()
+            offset       = cmapTable.readUint32()
+            subtable     = cmapTable.slice tableOffset + offset
+
+            encTables.push this.readCmapSubtable subtable
+
+    readCmapSubtable: (buffer) ->
+        format = buffer.readUint16()
+        length = buffer.readUint16()
+
+        switch format
+            when 4
+                
+
     readGlyphs: ->
         glyfTable  = this.getTable TTF_GLYF
         glyfOffset = glyfTable && @tables[TTF_GLYF].offset
@@ -298,6 +326,7 @@ class TTFReader
 
     readSingleGlyph: (glyph, buffer) ->
         glyph.endpointIndexes = []
+        glyph.points          = []
 
         for i in [0 .. glyph.numberOfContours - 1]
             glyph.endpointIndexes.push buffer.readUint16()
@@ -306,7 +335,7 @@ class TTFReader
         # the endpoints will always be indexes, and the last
         # endpoint for the last outline (contour) will be the
         # last point in the list.
-        numberOfPoints = Math.max glyph.endpointIndexes...
+        numberOfPoints = (Math.max glyph.endpointIndexes...) + 1 # (+1 as indexes begin at 0)
 
         # Skip the instructions
         buffer.skip buffer.readUint16()
@@ -315,8 +344,45 @@ class TTFReader
         if glyph.numberOfContours == 0
             return
 
-    readCompoundGlyph: (glyph, buffer) ->
+        flags = []
+        for i in [ 0 .. numberOfPoints - 1 ]
+            flag = buffer.readUint8()
+            flags.push flag
+            glyph.points.push onCurve: (flag & FLAG_ON_CURVE > 0)
 
+            # Check if flag is repeated; if it is, add that many /additional/
+            # flags and points, and increment i accordingly (no. of flags <= no. of points)
+            if flag & FLAG_REPEAT
+                repeats = buffer.readUint8()
+                i      += repeats 
+
+                for [ 0 .. repeats - 1 ]
+                    flags.push flag
+                    glyph.points.push onCurve: (flag & FLAG_ON_CURVE > 0)
+
+        # Process for reading coordinates is the same
+        readCoords = (axis, byteFlag, sameFlag) ->
+
+            # Value (the coordinate of this axis) changes relatively
+            value     = 0
+
+            for i in [ 0 .. numberOfPoints - 1 ]
+                flag = flags[i]
+                if flag & byteFlag
+                    # Same flag here means positive value if set
+                    value += (if flag & sameFlag then  1 else -1) * buffer.readUint8()
+                else if flag & sameFlag == 0
+                    # If not the same, read a 16-bit signed int
+                    value += buffer.readInt16()
+
+                points[i][axis] = value
+
+        # Read x-coordinates
+        readCoords 'x', FLAG_X_IS_BYTE, FLAG_X_IS_SAME
+        readCoords 'y', FLAG_Y_IS_BYTE, FLAG_Y_IS_SAME
+
+    readCompoundGlyph: (glyph, buffer) ->
+        # TODO
 
     getTable: (name) ->
         if @tables.hasOwnProperty name
