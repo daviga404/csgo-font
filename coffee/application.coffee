@@ -6,6 +6,8 @@ Utils      =
     # Converts a 32 bit int into a fixed point number (16.16)
     toFixed: (num) -> (num >> 16) + (num & 0xFFFF) * Math.pow(2, -16)
 
+    toF2Dot14: (num) -> (num >> 14) + (num & 0x3FFF) * Math.pow(2, -14)
+
 class Tag
 
     ###*
@@ -178,8 +180,10 @@ class DefineFont3Tag extends Tag
             0x80 | # flagsHasLayout = 1
             0    | # flagsShiftJIS  = 0 (TODO: add support for ShiftJIS)
             0    | # flagsSmallText = 0
-            # TODO
+            0# TODO
         )
+
+        console.log reader.encodingTables
 
 class TTFException extends Error
     constructor: (@message) ->
@@ -192,6 +196,8 @@ class TTFReader
     TTF_HEAD = 0x68656164 # Head table
     TTF_GLYF = 0x676C7966 # Glyf (glyph) table
     TTF_CMAP = 0x636D6170 # Cmap (character mapping) table
+    TTF_LOCA = 0x6C6F6361 # Loca (glyph location) table
+    TTF_MAXP = 0x6D617870 # Maxp (maximum profile) table
 
     # Bitmask constants
     FLAG_BIT_0 = 0x1
@@ -202,6 +208,8 @@ class TTFReader
     FLAG_BIT_5 = 0x20
     FLAG_BIT_6 = 0x40
     FLAG_BIT_7 = 0x80
+    FLAG_BIT_8 = 0x100
+    FLAG_BIT_9 = 0x200
 
     # Single glyph flags
     FLAG_ON_CURVE  = FLAG_BIT_0
@@ -211,11 +219,31 @@ class TTFReader
     FLAG_X_IS_SAME = FLAG_BIT_4
     FLAG_Y_IS_SAME = FLAG_BIT_5
 
+    # Compound glyph flags
+    FLAG_ARG_1_AND_2_ARE_WORDS = FLAG_BIT_0
+    FLAG_ARGS_ARE_XY_VALUES    = FLAG_BIT_1
+    FLAG_ROUND_XY_TO_GRID      = FLAG_BIT_2
+    FLAG_WE_HAVE_A_SCALE       = FLAG_BIT_3 # Bit 4 is reserved
+    FLAG_MORE_COMPONENTS       = FLAG_BIT_5
+    FLAG_WE_HAVE_AN_XY_SCALE   = FLAG_BIT_6
+    FLAG_WE_HAVE_A_TWO_BY_TWO  = FLAG_BIT_7
+    FLAG_WE_HAVE_INSTRUCTIONS  = FLAG_BIT_8
+    FLAG_USE_MY_METRICS        = FLAG_BIT_9
+
+    # Index to Loc Format
+    FORMAT_SHORT = 0
+    FORMAT_LONG  = 1
+
+    # Glyph types
+    GLYPH_TYPE_SINGLE   = 'single'
+    GLYPH_TYPE_COMPOUND = 'compound'
+
     constructor: (data) ->
         @data   = data.clone() # ByteBuffer of the raw TTF data
         @tables = {}           # Tables in file, indexed by their IDs
-        @head   = {}           # Head information in TTF; keys correspond to their camelCase equivalent in the TTF specification
+        @info   = {}           # Head & maxp information in TTF; keys are the relevant table (e.g. 'maxp'), and keys of those objects correspond to their camelCase equivalent in the TTF specification
         @glyphs = []           # Array of glyphs in the TTF file [TODO]
+        @encodingTables = []   # Array of char -> glyph mappings for different encodings. Contains objects with platformId, platformEncoding, and glyphIndexes keys
 
     read: ->
         @data.reset()
@@ -238,75 +266,169 @@ class TTFReader
             }
 
         # Read individual tables
-        this.readHeadTable()
+        this.readInfo()
         this.readGlyphs()
         this.readCmapTable()
 
-    readHeadTable: ->
+    readInfo: ->
+
+        ###
+        # Read 'head' table
+        ###
         headBuff = this.getTable TTF_HEAD
         if not headBuff
             throw new TTFException('Required head table not found in TTF file')
 
-        @head.version = Utils.toFixed headBuff.readUint32()
-        @head.fontRevision = Utils.toFixed headBuff.readUint32()
-        @head.checkSumAdjustment = headBuff.readUint32()
-        @head.magicNumber        = headBuff.readUint32()
-        @head.flags              = headBuff.readUint16()
-        @head.unitsPerEm         = headBuff.readUint16()
+        @info.head = {}
+        @info.head.version = Utils.toFixed headBuff.readUint32()
+        @info.head.fontRevision = Utils.toFixed headBuff.readUint32()
+        @info.head.checkSumAdjustment = headBuff.readUint32()
+        @info.head.magicNumber        = headBuff.readUint32()
+        @info.head.flags              = headBuff.readUint16()
+        @info.head.unitsPerEm         = headBuff.readUint16()
 
         # Skip the created and modified dates; not necessary,
         # and difficult to represent 64-bit ints in JS
         headBuff.skip 16
 
-        @head.xMin   = headBuff.readUint16()
-        @head.yMin   = headBuff.readUint16()
-        @head.xMax   = headBuff.readUint16()
-        @head.yMax   = headBuff.readUint16()
+        @info.head.xMin   = headBuff.readUint16()
+        @info.head.yMin   = headBuff.readUint16()
+        @info.head.xMax   = headBuff.readUint16()
+        @info.head.yMax   = headBuff.readUint16()
 
         macStyle = headBuff.readUint16()
-        @head.bold   = !!(macStyle & FLAG_BIT_0)
-        @head.italic = !!(macStyle & FLAG_BIT_1)
+        @info.head.bold   = !!(macStyle & FLAG_BIT_0)
+        @info.head.italic = !!(macStyle & FLAG_BIT_1)
 
-        @head.lowestRecPPEM     = headBuff.readUint16()
-        @head.fontDirectionHint = headBuff.readInt16()
-        @head.indexToLocFormat  = headBuff.readInt16()
-        @head.glyphDataFormat   = headBuff.readInt16()
+        @info.head.lowestRecPPEM     = headBuff.readUint16()
+        @info.head.fontDirectionHint = headBuff.readInt16()
+        @info.head.indexToLocFormat  = headBuff.readInt16()
+        @info.head.glyphDataFormat   = headBuff.readInt16()
+
+        ###
+        # Read 'maxp' table
+        ###
+        maxpBuff = this.getTable TTF_MAXP
+        if not maxpBuff
+            throw new TTFException('Required maxp table not found in TTF file')
+
+        maxpBuff.skip 4
+        @info.maxp = {}
+        @info.maxp.numGlyphs             = maxpBuff.readUint16()
+        @info.maxp.maxPoints             = maxpBuff.readUint16()
+        @info.maxp.maxContours           = maxpBuff.readUint16()
+        @info.maxp.maxCompositePoints    = maxpBuff.readUint16()
+        @info.maxp.maxCompositeContours  = maxpBuff.readUint16()
+        @info.maxp.maxZones              = maxpBuff.readUint16()
+        @info.maxp.maxTwilightPoints     = maxpBuff.readUint16()
+        @info.maxp.maxStorage            = maxpBuff.readUint16()
+        @info.maxp.maxFunctionDefs       = maxpBuff.readUint16()
+        @info.maxp.maxInstructionDefs    = maxpBuff.readUint16()
+        @info.maxp.maxStackElements      = maxpBuff.readUint16()
+        @info.maxp.maxSizeOfInstructions = maxpBuff.readUint16()
+        @info.maxp.maxComponentElements  = maxpBuff.readUint16()
+        @info.maxp.maxComponentDepth     = maxpBuff.readUint16()
 
     readCmapTable: ->
         cmapTable = this.getTable TTF_CMAP
         if not cmapTable
             throw new TTFException('Required cmap table not found in TTF file')
 
+        tableStart   = cmapTable.offset
         cmapTable.skip 2 # Skip table version number
         numEncTables = cmapTable.readUint16()
         encTables    = []
 
         for i in [ 0 ... numEncTables ]
-            tableOffset  = cmapTable.offset
             platId       = cmapTable.readUint16()
             platEncoding = cmapTable.readUint16()
             offset       = cmapTable.readUint32()
-            subtable     = cmapTable.slice tableOffset + offset
+            subtable     = cmapTable.slice tableStart + offset
 
-            encTables.push this.readCmapSubtable subtable
+            encTables.push
+                platformId: platId,
+                platformEncoding: platEncoding,
+                glyphIndexes: this.readCmapSubtable subtable
+
+        @encodingTables = encTables
 
     readCmapSubtable: (buffer) ->
-        format = buffer.readUint16()
-        length = buffer.readUint16()
+        format       = buffer.readUint16()
+        length       = buffer.readUint16()
+        #glyphIndexes = []
 
         switch format
+
+            # Format 4 : Microsoft's Format
             when 4
-                
+                return this.processCmapFormat4 buffer
+
+            else
+                return []
+                        
+    processCmapFormat4: (buffer) ->
+
+        glyphIndexes = []
+        segments     = []
+
+        buffer.skip 2 # Skip version
+        segCount = buffer.readUint16() / 2  # segCountX2
+        buffer.skip 6 # Skip search optimization
+
+        # Read endCodes
+        for i in [ 0 ... segCount ]
+            segments.push endCode: buffer.readUint16()
+
+        buffer.skip 2 # Skip reserved
+
+        # Read startCodes
+        for i in [ 0 ... segCount ]
+            segments[i].startCode = buffer.readUint16()
+
+        # Read idDeltas
+        for i in [ 0 ... segCount ]
+            segments[i].idDelta = buffer.readUint16()
+
+        # Get glyph to char mappings
+        for i in [ 0 ... segCount ] 
+            offset = buffer.offset
+            segments[i].idRangeOffset = buffer.readUint16()
+
+            # If idRangeOffset is 0, the glyph index of this character
+            # is (code + idDelta) mod 65536
+            if segments[i].idRangeOffset == 0
+                for j in [ segments[i].startCode .. segments[i].endCode ]
+                    glyphIndexes[j] = (j + segments[i].idDelta) % 65536
+
+            # If idRangeOffset is non-zero, it is used as an offset into
+            # the following glyphIdArray. Consult TTF documentation for how 
+            # the offset for this index is calculated.
+            else
+                for j in [ segments[i].startCode .. segments[i].endCode ]
+                    glyphIndexes[j] = buffer.readUint16 (offset + 2 * (j - segments[i].startCode))
+
+        return glyphIndexes
 
     readGlyphs: ->
+        # Read 'loca' table to find out offsets of glyphs
+        locaTable = this.getTable TTF_LOCA
+        if not locaTable
+            throw new TTFException('Required loca table not found in TTF file')
+
+        offsets    = []
+        readOffset = if @info.head.indexToLocFormat == FORMAT_SHORT then ByteBuffer.prototype.readUint16 else ByteBuffer.prototype.readUint32
+        multiplier = if @info.head.indexToLocFormat == FORMAT_SHORT then 2 else 1
+        for i in [ 0 .. @info.maxp.numGlyphs ] # Goes to maxp.numGlyphs + 1
+            offsets.push readOffset.apply(locaTable) * multiplier
+
+        # Read glyph table
         glyfTable  = this.getTable TTF_GLYF
-        glyfOffset = glyfTable && @tables[TTF_GLYF].offset
-        glyfLength = glyfTable && @tables[TTF_GLYF].length
         if not glyfTable
             throw new TTFException('Required glyf table not found in TTF file')
 
-        while glyfTable.offset - glyfOffset < glyfLength
-            @glyphs.push this.readGlyph(glyfTable)
+        for i in [ 0 ... @info.maxp.numGlyphs ]
+            offset = (glyfTable.offset + offsets[i]) # Offsets are relative to start of file (for whatever reason...)
+            @glyphs.push this.readGlyph glyfTable.slice offset
 
     readGlyph: (buffer) ->
         glyph = {}
@@ -319,16 +441,19 @@ class TTFReader
 
         if glyph.numberOfContours >= 0
             this.readSingleGlyph glyph, buffer
-        else
+        else if glyph.numberOfContours == -1
             this.readCompoundGlyph glyph, buffer
+        else
+            throw new TTFException('Invalid number of contours while reading glyph')
 
         return glyph
 
     readSingleGlyph: (glyph, buffer) ->
+        glyph.type = GLYPH_TYPE_SINGLE
         glyph.endpointIndexes = []
         glyph.points          = []
 
-        for i in [0 .. glyph.numberOfContours - 1]
+        for i in [0 ... glyph.numberOfContours]
             glyph.endpointIndexes.push buffer.readUint16()
 
         # Get the number of points; this is possible because
@@ -345,7 +470,8 @@ class TTFReader
             return
 
         flags = []
-        for i in [ 0 .. numberOfPoints - 1 ]
+        i = 0
+        while i < numberOfPoints
             flag = buffer.readUint8()
             flags.push flag
             glyph.points.push onCurve: (flag & FLAG_ON_CURVE > 0)
@@ -354,11 +480,13 @@ class TTFReader
             # flags and points, and increment i accordingly (no. of flags <= no. of points)
             if flag & FLAG_REPEAT
                 repeats = buffer.readUint8()
-                i      += repeats 
+                i      += repeats
 
-                for [ 0 .. repeats - 1 ]
+                for [ 0 ... repeats ]
                     flags.push flag
                     glyph.points.push onCurve: (flag & FLAG_ON_CURVE > 0)
+
+            i++
 
         # Process for reading coordinates is the same
         readCoords = (axis, byteFlag, sameFlag) ->
@@ -366,24 +494,71 @@ class TTFReader
             # Value (the coordinate of this axis) changes relatively
             value     = 0
 
-            for i in [ 0 .. numberOfPoints - 1 ]
+            for i in [ 0 ... glyph.points.length ]
                 flag = flags[i]
                 if flag & byteFlag
                     # Same flag here means positive value if set
-                    value += (if flag & sameFlag then  1 else -1) * buffer.readUint8()
-                else if flag & sameFlag == 0
+                    value += (if flag & sameFlag then 1 else -1) * buffer.readUint8()
+                else if (~flag) & sameFlag
                     # If not the same, read a 16-bit signed int
                     value += buffer.readInt16()
 
-                points[i][axis] = value
+                glyph.points[i][axis] = value
 
         # Read x-coordinates
         readCoords 'x', FLAG_X_IS_BYTE, FLAG_X_IS_SAME
         readCoords 'y', FLAG_Y_IS_BYTE, FLAG_Y_IS_SAME
 
     readCompoundGlyph: (glyph, buffer) ->
-        # TODO
+        glyph.type       = GLYPH_TYPE_COMPOUND
+        glyph.components = []
+        flags            = 0
 
+        # Do until no longer more components
+        while true
+            component =
+                flags:      buffer.readUint16()
+                glyphIndex: buffer.readUint16()
+                matrix:     a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 # Set up as identity matrix
+
+            # Assign flags = component.flags for convenience (and use outside of loop)
+            flags = component.flags
+
+            # Read arguments of appropriate size
+            argument1  = if flags & FLAG_ARG_1_AND_2_ARE_WORDS then buffer.readUint16() else buffer.readUint8()
+            argument2  = if flags & FLAG_ARG_1_AND_2_ARE_WORDS then buffer.readUint16() else buffer.readUint8()
+
+            # Flags are X/Y offsets
+            if flags & FLAG_ARGS_ARE_XY_VALUES
+                component.matrix.e = argument1
+                component.matrix.f = argument2
+            # Flags are glyph point indexes to overlay
+            else
+                component.srcPoint = argument1
+                component.dstPoint = argument2 
+
+            # Read scales (if necessary) into matrix
+            if flags & FLAG_WE_HAVE_A_SCALE
+                component.matrix.a = Utils.toF2Dot14 buffer.readUint16()
+                component.matrix.d = component.matrix.d
+            else if flags & FLAG_WE_HAVE_AN_XY_SCALE
+                component.matrix.a = Utils.toF2Dot14 buffer.readUint16()
+                component.matrix.d = Utils.toF2Dot14 buffer.readUint16()
+            else if flags & FLAG_WE_HAVE_A_TWO_BY_TWO
+                component.matrix.a = Utils.toF2Dot14 buffer.readUint16()
+                component.matrix.b = Utils.toF2Dot14 buffer.readUint16()
+                component.matrix.c = Utils.toF2Dot14 buffer.readUint16()
+                component.matrix.d = Utils.toF2Dot14 buffer.readUint16()
+
+            glyph.components.push component
+
+            break unless flags & FLAG_MORE_COMPONENTS
+
+        # Skip instructions
+        if flags & FLAG_WE_HAVE_INSTRUCTIONS
+            buffer.skip buffer.readUint16()
+
+    # TODO doc
     getTable: (name) ->
         if @tables.hasOwnProperty name
             offset = @tables[name].offset
@@ -392,6 +567,27 @@ class TTFReader
             # Return a new ByteBuffer of this table
             return @data.slice offset, offset + length
 
+        null
+
+    ###
+    # Gets loaded information about the font. The data is returned
+    # as an object, indexed by keys of the tables (e.g. 'head', 'maxp').
+    # The values of these keys are also objects, with keys as their
+    # camelCase equivalents to those in the TTF specification.
+    #
+    # Currently, the tables loaded in font info are 'head', and 'maxp'
+    #
+    # @return {Object}
+    ####
+    getFontInfo: ->
+        @info
+
+    # TODO doc
+    getGlyphs: ->
+        @glyphs
+
+    getGlyph: (charId) ->
+        # TODO
         null
 
 window.addEventListener 'load', ->
@@ -406,7 +602,28 @@ window.addEventListener 'load', ->
         fileReader.addEventListener 'load', ->
             buff     = fileReader.result
             fontBuff = ByteBuffer.wrap buff
-            fontTag  = new DefineFont3Tag(fontBuff)
+
+            ttfReader = new TTFReader(fontBuff)
+            ttfReader.read()
+
+            console.log 'Trying to do A character...'
+            glyphIndex = -1
+
+            for table in ttfReader.encodingTables
+                # MS Unicode
+                if table.platformId == 3 and table.platformEncoding == 1
+
+                    for key in table.glyphIndexes
+                        if table.glyphIndexes[key] == 0
+                            console.log key
+
+                    if 65 in table.glyphIndexes
+                        glyphIndex = table.glyphIndexes[65]
+
+            console.log glyphIndex
+            console.log ttfReader.getGlyphs()
+
+            #fontTag  = new DefineFont3Tag(fontBuff, { fontId: 4 })
             console.log 'Success!'
 
         fileReader.readAsArrayBuffer(file)
