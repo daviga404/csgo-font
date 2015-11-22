@@ -353,9 +353,8 @@ class TTFReader
         @encodingTables = encTables
 
     readCmapSubtable: (buffer) ->
-        format       = buffer.readUint16()
-        length       = buffer.readUint16()
-        #glyphIndexes = []
+        format = buffer.readUint16()
+        length = buffer.readUint16()
 
         switch format
 
@@ -363,11 +362,18 @@ class TTFReader
             when 4
                 return this.processCmapFormat4 buffer
 
+            # Format 6 : Trimmed Table Mapping
+            when 6
+                return this.processCmapFormat6 buffer
+
+            # Format 12 : Segmented Coverage
+            when 12
+                return this.processCmapFormat12 buffer
+
             else
                 return []
                         
     processCmapFormat4: (buffer) ->
-
         glyphIndexes = []
         segments     = []
 
@@ -407,6 +413,36 @@ class TTFReader
                 for j in [ segments[i].startCode .. segments[i].endCode ]
                     glyphIndexes[j] = buffer.readUint16 (offset + 2 * (j - segments[i].startCode))
 
+        return glyphIndexes
+
+    processCmapFormat6: (buffer) ->
+        buffer.skip 2
+        firstCode    = buffer.readUint16()
+        entryCount   = buffer.readUint16()
+        glyphIndexes = []
+
+        for i in [ firstCode ... firstCode + entryCount ]
+            glyphIndexes.push buffer.readUint16()
+
+        return glyphIndexes
+
+    processCmapFormat12: (buffer) ->
+        # Skip the length & language code: format 12 uses 32-bit values, with
+        # the format as fixed (16.16). This means we have read the format as 12,
+        # and the length as 0 (so it works)
+        buffer.skip 8
+
+        nGroups      = buffer.readUint32()
+        glyphIndexes = []
+
+        for i in [ 0 ... nGroups ]
+            startCharCode  = buffer.readUint32()
+            endCharCode    = buffer.readUint32()
+            startGlyphCode = buffer.readUint32()
+            glyphDiff      = startGlyphCode - startCharCode 
+            for j in [ startCharCode .. endCharCode ]
+                glyphIndexes[j] = j + glyphDiff
+        
         return glyphIndexes
 
     readGlyphs: ->
