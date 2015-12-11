@@ -594,7 +594,14 @@ class TTFReader
         if flags & FLAG_WE_HAVE_INSTRUCTIONS
             buffer.skip buffer.readUint16()
 
-    # TODO doc
+    ###*
+    # Gets a table from the loaded tables of the TTF file. Note that
+    # the tables are loaded upon the class' construction. The offset
+    # and length of tables can be accessed from `tables` after they
+    # have been loaded.
+    #
+    # @return {ByteBuffer} A buffer of the table's data
+    ###
     getTable: (name) ->
         if @tables.hasOwnProperty name
             offset = @tables[name].offset
@@ -605,7 +612,7 @@ class TTFReader
 
         null
 
-    ###
+    ###*
     # Gets loaded information about the font. The data is returned
     # as an object, indexed by keys of the tables (e.g. 'head', 'maxp').
     # The values of these keys are also objects, with keys as their
@@ -618,10 +625,15 @@ class TTFReader
     getFontInfo: ->
         @info
 
-    # TODO doc
+    ###*
+    # Gets a list of glyphs 
+    ###
     getGlyphs: ->
         @glyphs
 
+    ###*
+    # TODO: implement
+    ###
     getGlyph: (charId) ->
         # TODO
         null
